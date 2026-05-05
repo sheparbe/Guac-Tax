@@ -1,0 +1,237 @@
+---
+title: "r_01_scrape"
+author: "Bryce Shepard"
+date: "2026-05-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# R/01_scrape.R
+# Purpose: Get Chipotle store locations via Overpass API (OpenStreetMap)
+#          then join Census median household income by zip via tidycensus
+# Methods: API access (Overpass/OSM) + API access (tidycensus/Census Bureau)
+# Outputs: data/chipotle_locations_raw.csv
+#          data/chipotle_locations_clean.csv
+
+library(tidyverse)
+library(httr2)
+library(tidycensus)
+library(janitor)
+library(sf)
+library(tigris)
+
+# ── 1. Load credentials ────────────────────────────────────────────────────
+census_key <- Sys.getenv("CENSUS_API_KEY")
+if (census_key == "") stop("CENSUS_API_KEY not found. Did you restart R after editing .Renviron?")
+census_api_key(census_key, install = FALSE)
+
+# ── 2. Fetch all US Chipotle locations from OpenStreetMap Overpass API ─────
+cat("Querying Overpass API for US Chipotle locations...\n")
+
+overpass_query <- '
+[out:json][timeout:120];
+(
+  node["name"="Chipotle Mexican Grill"]["amenity"="fast_food"](24.0,-125.0,50.0,-66.0);
+  way["name"="Chipotle Mexican Grill"]["amenity"="fast_food"](24.0,-125.0,50.0,-66.0);
+  node["name"="Chipotle Mexican Grill"]["amenity"="fast_food"](18.0,-168.0,22.0,-154.0);
+  way["name"="Chipotle Mexican Grill"]["amenity"="fast_food"](18.0,-168.0,22.0,-154.0);
+);
+out center;
+'
+
+resp <- request("https://overpass-api.de/api/interpreter") |>
+  req_body_form(data = overpass_query) |>
+  req_timeout(120) |>
+  req_error(is_error = \(r) FALSE) |>
+  req_perform()
+
+cat("HTTP status:", resp_status(resp), "\n")
+
+if (resp_status(resp) != 200) {
+  stop("Overpass API request failed. Check your internet connection and try again.")
+}
+
+# ── 3. Parse the JSON response ─────────────────────────────────────────────
+body <- resp_body_json(resp)
+elements <- body$elements
+
+cat("Raw elements returned:", length(elements), "\n")
+
+parse_element <- function(el) {
+  tags <- el$tags %||% list()
+  tibble(
+    osm_id        = as.character(el$id %||% NA),
+    osm_type      = el$type            %||% NA_character_,
+    latitude      = as.numeric(el$lat  %||% el$center$lat %||% NA),
+    longitude     = as.numeric(el$lon  %||% el$center$lon %||% NA),
+    name          = tags$name                %||% NA_character_,
+    address       = tags$`addr:housenumber`  %||% NA_character_,
+    street        = tags$`addr:street`       %||% NA_character_,
+    city          = tags$`addr:city`         %||% NA_character_,
+    state         = tags$`addr:state`        %||% NA_character_,
+    zip           = tags$`addr:postcode`     %||% NA_character_,
+    phone         = tags$phone               %||% NA_character_,
+    website       = tags$website             %||% NA_character_,
+    opening_hours = tags$opening_hours       %||% NA_character_
+  )
+}
+
+locations_raw <- elements |>
+  map(possibly(parse_element, otherwise = NULL)) |>
+  list_rbind()
+
+cat("Rows parsed:", nrow(locations_raw), "\n")
+
+# Save raw immediately
+dir.create("data", showWarnings = FALSE)
+write_csv(locations_raw, "data/chipotle_locations_raw.csv")
+cat("✓ Saved: data/chipotle_locations_raw.csv\n")
+
+# ── 4. Clean ───────────────────────────────────────────────────────────────
+cat("\nCleaning location data...\n")
+
+locations_clean <- locations_raw |>
+  clean_names() |>
+  mutate(
+    full_address = case_when(
+      !is.na(address) & !is.na(street) ~ paste(address, street),
+      !is.na(street)                   ~ street,
+      TRUE                             ~ NA_character_
+    ),
+    zip   = str_extract(zip, "^\\d{5}"),
+    state = str_to_upper(str_trim(state)),
+    city  = str_to_title(str_trim(city))
+  ) |>
+  filter(str_detect(state, "^[A-Z]{2}$") | is.na(state)) |>
+  distinct(latitude, longitude, .keep_all = TRUE) |>
+  mutate(store_id = row_number())
+
+cat("Locations after cleaning:", nrow(locations_clean), "\n")
+cat("Locations with zip codes:", sum(!is.na(locations_clean$zip)), "\n")
+cat("Locations missing zip codes:", sum(is.na(locations_clean$zip)), "\n")
+
+# ── 5. Fill missing zips via spatial join ──────────────────────────────────
+missing_zip <- locations_clean |>
+  filter(is.na(zip), !is.na(latitude), !is.na(longitude))
+
+cat("Attempting to fill", nrow(missing_zip), "missing zips via spatial join...\n")
+
+if (nrow(missing_zip) > 0) {
+
+  # Download ZCTA boundaries
+  zcta_shapes <- tryCatch(
+    tigris::zctas(year = 2020, progress_bar = FALSE),
+    error = \(e) {
+      cat("Could not download ZCTA shapes — missing zips will stay NA\n")
+      NULL
+    }
+  )
+
+  if (!is.null(zcta_shapes)) {
+    # Convert missing-zip stores to sf points
+    missing_sf <- missing_zip |>
+      st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+    # Align CRS before spatial join
+    zcta_shapes <- st_transform(zcta_shapes, crs = 4326)
+
+    # Spatial join
+    joined <- st_join(missing_sf, zcta_shapes |> select(ZCTA5CE20)) |>
+      st_drop_geometry() |>
+      select(osm_id, zip_filled = ZCTA5CE20)
+
+    # Merge filled zips back
+    locations_clean <- locations_clean |>
+      left_join(joined, by = "osm_id") |>
+      mutate(zip = coalesce(zip, zip_filled)) |>
+      select(-zip_filled)
+
+    cat("Zips after spatial fill:", sum(!is.na(locations_clean$zip)), "\n")
+  }
+}
+
+# ── 6. Pull median household income by zip from tidycensus ────────────────
+cat("\nPulling Census ACS income data by zip code...\n")
+
+income_by_zip <- get_acs(
+  geography = "zcta",
+  variables = "B19013_001",
+  year      = 2022,
+  survey    = "acs5",
+  progress  = FALSE
+) |>
+  clean_names() |>
+  transmute(
+    zip           = str_extract(geoid, "\\d{5}"),
+    median_income = estimate,
+    income_moe    = moe
+  )
+
+cat("Zip codes with income data:", nrow(income_by_zip), "\n")
+
+# ── 7. Join locations to income ────────────────────────────────────────────
+cat("Joining locations to income data...\n")
+
+locations_with_income <- locations_clean |>
+  left_join(income_by_zip, by = "zip") |>
+  mutate(
+    income_quintile = ntile(median_income, 5),
+    income_quintile_label = case_when(
+      income_quintile == 1 ~ "Q1 Lowest",
+      income_quintile == 2 ~ "Q2 Low",
+      income_quintile == 3 ~ "Q3 Middle",
+      income_quintile == 4 ~ "Q4 High",
+      income_quintile == 5 ~ "Q5 Highest",
+      TRUE                 ~ "Unknown"
+    )
+  )
+
+# ── 8. Validation table ────────────────────────────────────────────────────
+cat("\n── Validation Summary ──────────────────────────────\n")
+
+validation <- locations_with_income |>
+  summarise(
+    total_locations      = n(),
+    has_zip              = sum(!is.na(zip)),
+    has_coordinates      = sum(!is.na(latitude) & !is.na(longitude)),
+    has_income           = sum(!is.na(median_income)),
+    missing_income       = sum(is.na(median_income)),
+    income_join_rate_pct = round(mean(!is.na(median_income)) * 100, 1),
+    avg_median_income    = round(mean(median_income, na.rm = TRUE), 0),
+    stores_q1_lowest     = sum(income_quintile_label == "Q1 Lowest", na.rm = TRUE),
+    stores_q5_highest    = sum(income_quintile_label == "Q5 Highest", na.rm = TRUE)
+  )
+
+print(validation)
+
+locations_validated <- locations_with_income |>
+  mutate(
+    flag_missing_zip    = is.na(zip),
+    flag_missing_income = is.na(median_income),
+    flag_missing_coords = is.na(latitude) | is.na(longitude),
+    flag_invalid_state  = !str_detect(state, "^[A-Z]{2}$") & !is.na(state),
+    flag_any_issue      = flag_missing_zip | flag_missing_income |
+                          flag_missing_coords | flag_invalid_state
+  )
+
+cat("Total flagged rows:", sum(locations_validated$flag_any_issue), "\n")
+cat("Flag breakdown:\n")
+locations_validated |>
+  summarise(across(starts_with("flag_"), sum)) |>
+  pivot_longer(everything(), names_to = "flag", values_to = "count") |>
+  print()
+
+# ── 9. Save final output ───────────────────────────────────────────────────
+write_csv(locations_validated, "data/chipotle_locations_clean.csv")
+
+cat("\n✓ Saved: data/chipotle_locations_clean.csv\n")
+cat("\nSample rows:\n")
+locations_validated |>
+  select(store_id, city, state, zip, median_income, income_quintile_label) |>
+  head(10) |>
+  print()
+```
