@@ -1,0 +1,11 @@
+# Data outputs — don't commit raw data
+data/
+
+# Environment file — NEVER commit this
+.Renviron
+
+# R artifacts
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
